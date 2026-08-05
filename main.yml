@@ -1,0 +1,33 @@
+name: MC Shop Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # GitHub 最小粒度 5 分钟
+  workflow_dispatch:          # 允许手动运行（网页按钮触发）
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6         # 给 5 轮×60s 留余量
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run monitor script
+        env:
+          SITE_ACCESS:  ${{ secrets.SITE_ACCESS }}
+          SMTP_SERVER:  ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT:    ${{ secrets.SMTP_PORT }}
+          SMTP_USER:    ${{ secrets.SMTP_USER }}
+          SMTP_PASS:    ${{ secrets.SMTP_PASS }}
+          ALERT_MAIL:   ${{ secrets.ALERT_MAIL }}
+          MONITOR_TASKS: ${{ secrets.MONITOR_TASKS }}
+        run: python monitor.py
