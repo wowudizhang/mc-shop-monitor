@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MC 商店云端监控（邮件版 · 1分钟粒度 · 正式版）
-- GitHub Actions 每5分钟唤醒一次
-- 脚本内部循环5轮，每轮 sleep 60s → 等效 1分钟查一次
-- 同商品同商家同价格：5分钟内只发1封邮件（防刷屏）
+MC 商店云端监控（邮件版 · 汇总发送）
+- 每轮扫描结束后，将本轮所有命中结果汇总为一封邮件
 """
 
 import os
@@ -16,7 +14,7 @@ import requests
 from email.mime.text import MIMEText
 from email.header import Header
 
-# ========== 配置（从 Secrets 读取） ==========
+# ========== 配置 ==========
 SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER")
@@ -26,27 +24,22 @@ ALERT_MAIL = os.getenv("ALERT_MAIL")
 API_BASE = "http://103.236.99.176:1201/api/shops"
 SITE_ACCESS = os.getenv("SITE_ACCESS")
 
-# ========== 运行参数 ==========
-LOOP_COUNT = 5          # 5 轮
-SLEEP_SECONDS = 60      # 每轮间隔 60 秒
-COOLDOWN = 300          # 同商品 5 分钟内只提醒一次
+LOOP_COUNT = 5
+SLEEP_SECONDS = 60
+COOLDOWN = 300
 
-# ========== 初始化 ==========
 session = requests.Session()
 session.headers.update({
     "Cookie": f"site_access={SITE_ACCESS}",
     "User-Agent": "Mozilla/5.0"
 })
 
-alert_cache = {}  # key -> last_alert_time
-
+alert_cache = {}
 
 def clean_name(name: str) -> str:
     return re.sub(r"§.", "", name or "")
 
-
 def send_mail(subject: str, body: str):
-    """发送邮件（SSL / STARTTLS 自适应）"""
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = SMTP_USER
@@ -66,10 +59,9 @@ def send_mail(subject: str, body: str):
     except Exception as e:
         print("❌ 邮件发送失败:", e)
 
-
 def check_all_tasks(tasks):
-    """对全部任务各查一次，命中即发邮件（受冷却限制）"""
     now = time.time()
+    hits = []  # ✅ 本轮命中结果收集
 
     for task in tasks:
         keyword = task["keyword"]
@@ -108,50 +100,48 @@ def check_all_tasks(tasks):
 
             key = f"{name}|{merchant}|{price}"
             if key in alert_cache and now - alert_cache[key] < COOLDOWN:
-                continue  # 冷却中，跳过
+                continue
 
             alert_cache[key] = now
+            hits.append({
+                "name": name,
+                "price": price,
+                "amount": amount,
+                "merchant": merchant,
+                "world": world,
+                "coord": f"{x},{y},{z}",
+                "type": ttype
+            })
 
-            subject = f"🚨 MC商店提醒：{name} {price}"
-            body = (
-                f"商品：{name}\n"
-                f"类型：{'售卖' if ttype == 'sell' else '收购'}\n"
-                f"价格：{price}\n"
-                f"库存：{amount}\n"
-                f"商家：{merchant}\n"
-                f"世界：{world}\n"
-                f"坐标：{x},{y},{z}\n"
-                f"\n时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+    # ✅ 本轮结束后统一发一封邮件
+    if hits:
+        subject = f"🚨 MC商店提醒：共 {len(hits)} 条命中"
+        body_lines = [f"扫描时间：{time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
+        for h in hits:
+            body_lines.append(
+                f"【{h['name']}】\n"
+                f"类型：{'售卖' if h['type'] == 'sell' else '收购'}\n"
+                f"价格：{h['price']}  库存：{h['amount']}\n"
+                f"商家：{h['merchant']}\n"
+                f"世界：{h['world']}\n"
+                f"坐标：{h['coord']}\n"
             )
-            print(f"✅ 命中 [{keyword}]，发送邮件")
-            send_mail(subject, body)
-            return  # 本轮只发一封，防刷屏
-
+        send_mail(subject, "\n".join(body_lines))
+        print(f"✅ 本轮汇总发送 {len(hits)} 条")
+    else:
+        print("ℹ️ 本轮无命中")
 
 def main():
     print("=" * 60)
-    print("📧 MC 商店云端监控（邮件版 · 1分钟粒度）")
+    print("📧 MC 商店云端监控（汇总邮件版）")
     print("=" * 60)
 
-    if not SITE_ACCESS:
-        print("❌ 未配置 SITE_ACCESS")
+    if not all([SITE_ACCESS, SMTP_SERVER, SMTP_USER, SMTP_PASS, ALERT_MAIL]):
+        print("❌ 配置不完整")
         return
 
-    if not all([SMTP_SERVER, SMTP_USER, SMTP_PASS, ALERT_MAIL]):
-        print("❌ SMTP 配置不完整")
-        return
-
-    try:
-        tasks = json.loads(os.getenv("MONITOR_TASKS"))
-    except Exception as e:
-        print("❌ MONITOR_TASKS JSON 解析失败:", e)
-        return
-
+    tasks = json.loads(os.getenv("MONITOR_TASKS"))
     print(f"📋 共 {len(tasks)} 个监控任务")
-    for t in tasks:
-        print(f"   - {t['keyword']} {t['type']} 阈值={t['max_price']}")
-    print(f"⏱ 每 {SLEEP_SECONDS}s 检查一次，共 {LOOP_COUNT} 轮")
-    print("-" * 60)
 
     for i in range(1, LOOP_COUNT + 1):
         print(f"\n--- 第 {i}/{LOOP_COUNT} 轮 ---")
@@ -160,7 +150,6 @@ def main():
             time.sleep(SLEEP_SECONDS)
 
     print("\n✅ 本轮监控结束")
-
 
 if __name__ == "__main__":
     main()
