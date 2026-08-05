@@ -1,0 +1,30 @@
+name: MC Shop Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 每5分钟运行一次
+  workflow_dispatch:      # 允许手动点击运行
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install requests
+          
+      - name: Run monitor script
+        env:
+          SITE_ACCESS: ${{ secrets.SITE_ACCESS }}
+          MIAO_ID: ${{ secrets.MIAO_ID }}
+          MONITOR_TASKS: ${{ secrets.MONITOR_TASKS }}
+        run: |
+          python monitor.py
