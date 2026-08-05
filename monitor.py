@@ -1,164 +1,162 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MC 商店云端监控脚本（GitHub Actions 版）
-========================================
-- 每次 Action 触发后，循环抓取 N 轮（模拟每分钟一次）
-- 发现符合条件的商品 → 通过喵提醒推送到微信
-- 所有配置从环境变量读取（GitHub Secrets 注入）
+MC 商店云端监控（邮件版 · 1分钟粒度）
+- GitHub Actions 每5分钟唤醒一次
+- 脚本内部循环5轮，每轮 sleep 60s → 等效 1分钟查一次
+- 同商品同商家同价格：5分钟内只发1封邮件（防刷屏）
 """
 
 import os
 import time
 import json
-import urllib.parse
-import urllib.request
-import ssl
+import re
+import smtplib
+import requests
+from email.mime.text import MIMEText
+from email.header import Header
 
-# ========== 从环境变量读取配置（GitHub Secrets 注入） ==========
-SITE_ACCESS   = os.environ.get("SITE_ACCESS", "").strip()
-MIAO_ID       = os.environ.get("MIAO_ID", "").strip()
-API_BASE      = "http://103.236.99.176:1201/api/shops"
+# ========== 配置（从 Secrets 读取） ==========
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+ALERT_MAIL = os.getenv("ALERT_MAIL")
 
-# 监控任务列表（JSON 字符串，GitHub Secret: MONITOR_TASKS）
-# 格式：[{"keyword":"遗落","type":"sell","max_price":18,"stock_only":true}, ...]
-TASKS_JSON    = os.environ.get("MONITOR_TASKS", "[]")
+API_BASE = "http://103.236.99.176:1201/api/shops"
+SITE_ACCESS = os.getenv("SITE_ACCESS")
 
-# 单次 Action 运行参数
-LOOP_COUNT    = int(os.environ.get("LOOP_COUNT", "5"))   # 循环轮数（每轮≈1分钟）
-SLEEP_SECONDS = int(os.environ.get("SLEEP_SECONDS", "60")) # 每轮间隔
+# ========== 运行参数 ==========
+LOOP_COUNT = 5          # 5 轮
+SLEEP_SECONDS = 60      # 每轮间隔 60 秒
+COOLDOWN = 300          # 同商品 5 分钟内只提醒一次
 
-# ========== 工具函数 ==========
-def log(msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+# ========== 初始化 ==========
+session = requests.Session()
+session.headers.update({
+    "Cookie": f"site_access={SITE_ACCESS}",
+    "User-Agent": "Mozilla/5.0"
+})
 
-def clean_name(name):
-    """去掉 Minecraft §颜色代码"""
-    import re
+alert_cache = {}  # key -> last_alert_time
+
+
+def clean_name(name: str) -> str:
     return re.sub(r"§.", "", name or "")
 
-def build_url(keyword, type_, stock=1, limit=100):
-    sort = "priceAsc" if type_ == "sell" else "priceDesc"
-    q = urllib.parse.quote(keyword)
-    return f"{API_BASE}?q={q}&type={type_}&merchant=all&stock={stock}&sort={sort}&limit={limit}"
 
-def fetch_json(url):
-    """带 Cookie 请求 API"""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    req = urllib.request.Request(url)
-    req.add_header("Cookie", f"site_access={SITE_ACCESS}")
-    req.add_header("User-Agent", "MC-Monitor/1.0")
-    req.add_header("Accept", "application/json")
-
-    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-def send_miao(text):
-    """发送喵提醒到微信"""
-    if not MIAO_ID:
-        log("⚠️ 未配置 MIAO_ID，跳过推送")
-        return
-    url = f"https://miaotixing.com/trigger?id={MIAO_ID}"
-    data = urllib.parse.urlencode({"text": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+def send_mail(subject: str, body: str):
+    """发送邮件（SSL / STARTTLS 自适应）"""
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            log(f"✅ 喵提醒推送成功: {resp.read().decode()[:50]}")
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = SMTP_USER
+        msg["To"] = ALERT_MAIL
+        msg["Subject"] = Header(subject, "utf-8")
+
+        if SMTP_PORT == 465:
+            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=15)
+        else:
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15)
+            server.starttls()
+
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, [ALERT_MAIL], msg.as_string())
+        server.quit()
+        print("✅ 邮件发送成功")
     except Exception as e:
-        log(f"❌ 喵提醒推送失败: {e}")
+        print("❌ 邮件发送失败:", e)
 
-def check_task(task):
-    """检查单个监控任务"""
-    keyword   = task["keyword"]
-    type_     = task["type"]          # sell / buy
-    max_price = float(task.get("max_price", 999))
-    min_price = float(task.get("min_price", 0))
-    stock_only = task.get("stock_only", True)
 
-    log(f"🔍 查询: {keyword} | 类型: {type_}")
+def check_all_tasks(tasks):
+    """对全部任务各查一次，命中即发邮件（受冷却限制）"""
+    now = time.time()
 
-    url = build_url(keyword, type_, stock=1 if stock_only else 0)
-    data = fetch_json(url)
-    entries = data.get("entries", [])
+    for task in tasks:
+        keyword = task["keyword"]
+        ttype = task["type"]
+        max_price = float(task["max_price"])
+        stock_only = task.get("stock_only", True)
+        sort = "priceAsc" if ttype == "sell" else "priceDesc"
 
-    hits = []
-    for e in entries:
-        price  = float(e.get("price", 0))
-        amount = int(e.get("amount", 0))
-        if stock_only and amount <= 0:
+        url = f"{API_BASE}?q={keyword}&type={ttype}&stock=1&sort={sort}&limit=50"
+
+        try:
+            r = session.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"❌ 请求失败 [{keyword}]: {e}")
             continue
-        if type_ == "sell":
-            if price <= max_price:
-                hits.append(e)
-        else:  # buy
-            if price >= max_price:
-                hits.append(e)
 
-    if hits:
-        for h in hits[:5]:  # 最多推5条
-            name = clean_name(h.get("plainName", ""))
-            text = (
-                f"🎯 MC商店提醒\n"
-                f"商品: {name}\n"
-                f"类型: {'售卖' if type_=='sell' else '收购'}\n"
-                f"价格: {h['price']} (阈值: {max_price})\n"
-                f"数量: {h.get('amount','?')}\n"
-                f"商家: {h.get('merchantName','')}\n"
-                f"世界: {h.get('worldDisplay', h.get('world',''))}\n"
-                f"坐标: ({h.get('x','?')},{h.get('y','?')},{h.get('z','?')})"
+        for item in data.get("entries", []):
+            if stock_only and item.get("amount", 0) <= 0:
+                continue
+
+            price = float(item.get("price", 0))
+            match = (
+                (ttype == "sell" and price <= max_price) or
+                (ttype == "buy" and price >= max_price)
             )
-            send_miao(text)
-            time.sleep(1)  # 防止推送过快
-        log(f"✅ 命中 {len(hits)} 条")
-    else:
-        log(f"ℹ️ 无符合条件商品 (共 {len(entries)} 条)")
+            if not match:
+                continue
+
+            name = clean_name(item.get("plainName", ""))
+            merchant = item.get("merchantName", "")
+            world = item.get("worldDisplay", "")
+            x, y, z = item.get("x"), item.get("y"), item.get("z")
+            amount = item.get("amount")
+
+            key = f"{name}|{merchant}|{price}"
+            if key in alert_cache and now - alert_cache[key] < COOLDOWN:
+                continue  # 冷却中，跳过
+
+            alert_cache[key] = now
+
+            subject = f"🚨 MC商店提醒：{name} {price}"
+            body = (
+                f"商品：{name}\n"
+                f"类型：{'售卖' if ttype == 'sell' else '收购'}\n"
+                f"价格：{price}\n"
+                f"库存：{amount}\n"
+                f"商家：{merchant}\n"
+                f"世界：{world}\n"
+                f"坐标：{x},{y},{z}\n"
+                f"\n时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            print(f"✅ 命中 [{keyword}]，发送邮件")
+            send_mail(subject, body)
+            return  # 本轮只发一封，防刷屏
+
 
 def main():
-    log("=" * 50)
-    log("MC 商店云端监控启动")
-    log(f"Cookie: {'已配置' if SITE_ACCESS else '❌ 未配置'}")
-    log(f"喵提醒: {'已配置' if MIAO_ID else '❌ 未配置'}")
+    print("=" * 50)
+    print("📧 MC 商店云端监控（邮件版 · 1分钟粒度）")
+    print("=" * 50)
+
+    if not SITE_ACCESS:
+        print("❌ 未配置 SITE_ACCESS"); return
+    if not all([SMTP_SERVER, SMTP_USER, SMTP_PASS, ALERT_MAIL]):
+        print("❌ SMTP 配置不完整"); return
 
     try:
-        tasks = json.loads(TASKS_JSON)
-    except json.JSONDecodeError:
-        log("❌ MONITOR_TASKS JSON 解析失败")
-        return
+        tasks = json.loads(os.getenv("MONITOR_TASKS"))
+    except Exception as e:
+        print("❌ MONITOR_TASKS JSON 解析失败:", e); return
 
-    if not tasks:
-        log("⚠️ 没有配置监控任务，请在 Secrets 中设置 MONITOR_TASKS")
-        return
-
-    log(f"📋 共 {len(tasks)} 个监控任务")
+    print(f"📋 共 {len(tasks)} 个监控任务")
     for t in tasks:
-        log(f"   - {t.get('keyword','?')} [{t.get('type','?')}] 阈值={t.get('max_price','?')}")
+        print(f"   - {t['keyword']} {t['type']} 阈值={t['max_price']}")
+    print(f"⏱ 每 {SLEEP_SECONDS}s 检查一次，共 {LOOP_COUNT} 轮")
+    print("-" * 50)
 
-    # 先跑一次
-    for task in tasks:
-        try:
-            check_task(task)
-        except Exception as e:
-            log(f"❌ 任务异常: {e}")
-        time.sleep(2)
+    for i in range(1, LOOP_COUNT + 1):
+        print(f"\n--- 第 {i}/{LOOP_COUNT} 轮 ---")
+        check_all_tasks(tasks)
+        if i < LOOP_COUNT:
+            time.sleep(SLEEP_SECONDS)
 
-    # 循环多轮（模拟每分钟一次）
-    for i in range(1, LOOP_COUNT):
-        log(f"\n--- 第 {i+1}/{LOOP_COUNT} 轮 ---")
-        time.sleep(SLEEP_SECONDS)
-        for task in tasks:
-            try:
-                check_task(task)
-            except Exception as e:
-                log(f"❌ 任务异常: {e}")
-            time.sleep(2)
+    print("\n✅ 本轮监控结束")
 
-    log("=" * 50)
-    log("本轮监控结束")
 
 if __name__ == "__main__":
     main()
