@@ -1,26 +1,8 @@
 [
   {
-    "keyword": "遗落",
-    "type": "sell",
-    "max_price": 18,
-    "stock_only": true
-  },
-  {
-    "keyword": "深渊邀请函",
+    "keyword": "山谷",
     "type": "sell",
     "max_price": 20,
-    "stock_only": true
-  },
-  {
-    "keyword": "遗落",
-    "type": "buy",
-    "max_price": 15,
-    "stock_only": true
-  },
-  {
-    "keyword": "山谷深林",
-    "type": "sell",
-    "max_price": 25,
     "stock_only": true
   }
 ]
