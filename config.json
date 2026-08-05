@@ -2,7 +2,7 @@
   {
     "keyword": "山谷",
     "type": "sell",
-    "max_price": 20,
+    "max_price": 25,
     "stock_only": true
   }
 ]
